@@ -1867,7 +1867,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
         GGML_LOG_ERROR("Device %s: %s (%zu MiB, %zu MiB free)\n",  ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-               total / 1024 / 1024, free / 1024 / 1024)        
+               total / 1024 / 1024, free / 1024 / 1024);
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             GGML_LOG_ERROR("Failed to create backend for device %s\n", dev->iface.get_name(dev));
