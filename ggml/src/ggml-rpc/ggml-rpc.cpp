@@ -6,6 +6,13 @@
 #include <cinttypes>
 #include <string>
 #include <vector>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#define GGML_LOG_ERROR(...) __android_log_print(ANDROID_LOG_ERROR, "GGML-RPC", __VA_ARGS__)
+#endif
+
+
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -235,6 +242,7 @@ struct ggml_backend_rpc_buffer_type_context {
     std::string name;
     size_t      alignment;
     size_t      max_size;
+    std::shared_ptr<socket_t> sock;
 };
 
 struct graph_cache {
@@ -266,6 +274,7 @@ struct ggml_backend_rpc_context {
     uint32_t    device;
     std::string name;
     graph_cache gc;
+    std::shared_ptr<socket_t> sock;
 };
 
 struct ggml_backend_rpc_buffer_context {
@@ -319,6 +328,7 @@ static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     auto sock_ptr = make_socket(sockfd);
     if (sock_ptr == nullptr) {
+        GGML_LOG_ERROR("make_socket failed in socket_connect\n");
         return nullptr;
     }
     if (!set_no_delay(sockfd)) {
@@ -327,15 +337,19 @@ static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
     }
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
+    GGML_LOG_ERROR("Resolving host %s...\n", host);
     struct hostent * server = gethostbyname(host);
     if (server == NULL) {
         GGML_LOG_ERROR("Cannot resolve host '%s'\n", host);
         return nullptr;
     }
     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    GGML_LOG_ERROR("Connecting to %s:%d...\n", host, port);
     if (connect(sock_ptr->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        GGML_LOG_ERROR("Connect failed to %s:%d: %s\n", host, port, strerror(errno));
         return nullptr;
     }
+    GGML_LOG_ERROR("Connected successfully to %s:%d\n", host, port);
     return sock_ptr;
 }
 
@@ -356,25 +370,29 @@ static std::shared_ptr<socket_t> create_server_socket(const char * host, int por
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     auto sock = make_socket(sockfd);
     if (sock == nullptr) {
+        GGML_LOG_ERROR("make_socket failed\n");
         return nullptr;
     }
     if (!set_reuse_addr(sockfd)) {
         GGML_LOG_ERROR("Failed to set SO_REUSEADDR\n");
         return nullptr;
     }
-    if (inet_addr(host) == INADDR_NONE) {
+    if (inet_addr(host) == INADDR_NONE && strcmp(host, "255.255.255.255") != 0) {
         GGML_LOG_ERROR("Invalid host address: %s\n", host);
         return nullptr;
     }
     struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = inet_addr(host);
     serv_addr.sin_port = htons(port);
 
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+        GGML_LOG_ERROR("bind failed: %s\n", strerror(errno));
         return nullptr;
     }
     if (listen(sockfd, 1) < 0) {
+        GGML_LOG_ERROR("listen failed: %s\n", strerror(errno));
         return nullptr;
     }
     return sock;
@@ -386,8 +404,8 @@ static bool send_data(sockfd_t sockfd, const void * data, size_t size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
         ssize_t n = send(sockfd, (const char *)data + bytes_sent, size_to_send, 0);
         if (n < 0) {
-            GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
-                           bytes_sent, size_to_send);
+            GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu): %s\n",
+                           bytes_sent, size_to_send, strerror(errno));
             return false;
         }
         bytes_sent += (size_t)n;
@@ -401,8 +419,8 @@ static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
         ssize_t n = recv(sockfd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
-            GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
-                           bytes_recv, size_to_recv);
+            GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu): %s\n",
+                           bytes_recv, size_to_recv, strerror(errno));
             return false;
         }
         if (n == 0) {
@@ -415,7 +433,8 @@ static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
 }
 
 static bool send_msg(sockfd_t sockfd, const void * msg, size_t msg_size) {
-    if (!send_data(sockfd, &msg_size, sizeof(msg_size))) {
+    uint64_t size_to_send = msg_size; //standardized 64-bit size (S5 is 32-bit)
+    if (!send_data(sockfd, &size_to_send, sizeof(size_to_send))) {
         return false;
     }
     return send_data(sockfd, msg, msg_size);
@@ -459,15 +478,18 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
-    uint8_t cmd_byte = cmd;
+    uint8_t cmd_byte = (uint8_t)cmd;
     if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
         return false;
     }
-    if (!send_data(sock->fd, &input_size, sizeof(input_size))) {
+    uint64_t size_to_send = input_size;
+    if (!send_data(sock->fd, &size_to_send, sizeof(size_to_send))) {
         return false;
     }
-    if (!send_data(sock->fd, input, input_size)) {
-        return false;
+    if (input_size > 0) {
+        if (!send_data(sock->fd, input, input_size)) {
+            return false;
+        }
     }
     return true;
 }
@@ -498,13 +520,12 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
 static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
     rpc_msg_hello_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, nullptr, 0, &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        return false;
+    }
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n", response.major, response.minor, response.patch);
         return false;
-    }
-    if (response.minor != RPC_PROTO_MINOR_VERSION || response.patch != RPC_PROTO_PATCH_VERSION) {
-        GGML_LOG_INFO("WARNING: RPC server version mismatch: %d.%d.%d\n", response.major, response.minor, response.patch);
     }
     return true;
 }
@@ -512,19 +533,16 @@ static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
+    static std::unordered_map<std::string, std::shared_ptr<socket_t>> sockets;
     static bool initialized = false;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
-            return sock;
-        }
+        return it->second;
     }
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
-        GGML_LOG_ERROR("Failed to parse endpoint: %s\n", endpoint.c_str());
         return nullptr;
     }
 #ifdef _WIN32
@@ -546,7 +564,6 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (!check_server_version(sock)) {
         return nullptr;
     }
-    LOG_DBG("[%s] connected to %s, sockfd=%d\n", __func__, endpoint.c_str(), sock->fd);
     sockets[endpoint] = sock;
     return sock;
 }
@@ -926,7 +943,8 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
         /* .device    = */ device,
         /* .name      = */ buft_name,
         /* .alignment = */ alignment,
-        /* .max_size  = */ max_size
+        /* .max_size  = */ max_size,
+        /* .sock      = */ sock
     };
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
@@ -945,6 +963,7 @@ ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
         /* .device   = */ device,
         /* .name     = */ dev_name,
         /* .gc       = */ {},
+        /* .sock     = */ get_socket(endpoint)
     };
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_t backend = new ggml_backend {
@@ -1580,6 +1599,7 @@ rpc_server::~rpc_server() {
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
                              sockfd_t sockfd) {
+    GGML_LOG_ERROR("[%s] Starting rpc_serve_client for sockfd=%d\n", __func__, sockfd);
     rpc_server server(backends, cache_dir);
     uint8_t cmd;
     if (!recv_data(sockfd, &cmd, 1)) {
@@ -1587,7 +1607,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
     // the first command sent by the client must be HELLO
     if (cmd != RPC_CMD_HELLO) {
-        GGML_LOG_ERROR("Expected HELLO command, update client\n");
+        GGML_LOG_ERROR("Expected HELLO command (%d), got %d. Update client\n", RPC_CMD_HELLO, cmd);
         return;
     }
     if (!recv_msg(sockfd, nullptr, 0)) {
@@ -1825,30 +1845,32 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         }
     }
 }
+// devie interface
+
+struct ggml_backend_rpc_device_context {
+    std::string endpoint;
+    uint32_t    device;
+    std::string name;
+    std::string description;
+};
 
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
-        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
+        GGML_LOG_ERROR("Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
     }
     std::vector<ggml_backend_t> backends;
-    printf("Starting RPC server v%d.%d.%d\n",
-        RPC_PROTO_MAJOR_VERSION,
-        RPC_PROTO_MINOR_VERSION,
-        RPC_PROTO_PATCH_VERSION);
-    printf("  endpoint       : %s\n", endpoint);
-    printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
-    printf("Devices:\n");
+    GGML_LOG_ERROR("Starting RPC server, endpoint: %s local cache: %s Devices:\n", endpoint, cache_dir ? cache_dir : "n/a");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
-        printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-               total / 1024 / 1024, free / 1024 / 1024);
+        GGML_LOG_ERROR("Device %s: %s (%zu MiB, %zu MiB free)\n",  ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+               total / 1024 / 1024, free / 1024 / 1024)        
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
-            fprintf(stderr, "Failed to create backend for device %s\n", dev->iface.get_name(dev));
+            GGML_LOG_ERROR("Failed to create backend for device %s\n", dev->iface.get_name(dev));
             return;
         }
         backends.push_back(backend);
@@ -1864,51 +1886,30 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
+        GGML_LOG_ERROR("parse_endpoint failed for %s\n", endpoint);
         return;
     }
-#ifdef _WIN32
-    {
-        WSADATA wsaData;
-        int res = WSAStartup(MAKEWORD(2, 2), &wsaData);
-        if (res != 0) {
-            fprintf(stderr, "WSAStartup failed: %d\n", res);
-            return;
-        }
-    }
-#endif
+
     auto server_socket = create_server_socket(host.c_str(), port);
     if (server_socket == nullptr) {
-        fprintf(stderr, "Failed to create server socket\n");
+        GGML_LOG_ERROR("Failed to create server socket\n");
         return;
     }
+    GGML_LOG_ERROR("Server socket created successfully, waiting for accept\n");
     while (true) {
         auto client_socket = socket_accept(server_socket->fd);
         if (client_socket == nullptr) {
-            fprintf(stderr, "Failed to accept client connection\n");
+            GGML_LOG_ERROR("Failed to accept client connection, errno: %s\n", strerror(errno));
             return;
         }
-        printf("Accepted client connection\n");
-        fflush(stdout);
+        GGML_LOG_ERROR("Accepted client connection\n");
         rpc_serve_client(backends, cache_dir, client_socket->fd);
-        printf("Client connection closed\n");
-        fflush(stdout);
+        GGML_LOG_ERROR("Client connection closed\n");
     }
-#ifdef _WIN32
-    WSACleanup();
-#endif
     for (auto backend : backends) {
         ggml_backend_free(backend);
     }
 }
-
-// device interface
-
-struct ggml_backend_rpc_device_context {
-    std::string endpoint;
-    uint32_t    device;
-    std::string name;
-    std::string description;
-};
 
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;

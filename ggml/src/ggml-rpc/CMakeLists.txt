@@ -7,3 +7,7 @@ ggml_add_backend_library(ggml-rpc
 if (WIN32)
     target_link_libraries(ggml-rpc PRIVATE ws2_32)
 endif()
+
+if (ANDROID)
+    target_link_libraries(ggml-rpc PRIVATE log)
+endif()
